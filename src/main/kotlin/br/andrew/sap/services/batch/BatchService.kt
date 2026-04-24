@@ -72,13 +72,19 @@ class BatchService(val rest : RestTemplate,
             rest.exchange(request.body(body), String::class.java).body
         }
         val resposta = BatchRespondeHandler().parseBatchResponse(retorno!!)
-        resposta.filter { !it.success}
-            .map { it.errorMessage }
-            .reduce { str, batchResponse -> "$batchResponse. \n$str" }
-            .also {
-                if(it?.isNotEmpty() == true)
-                    throw Exception(it)
+        val erros = resposta.filter { !it.success }
+        if (erros.isNotEmpty()) {
+            val mensagem = erros.joinToString("\n") { response ->
+                val item = response.contentId?.let { bathList.elementAtOrNull(it - 1) }
+                val docId = (item?.second as? BatchId)?.getDisplayId()
+                val erro = response.errorMessage ?: response.body ?: "Erro ${response.statusCode}"
+                if (docId != null) "Pedido $docId: $erro"
+                else erro
             }
+            throw Exception(mensagem)
+        }
         return resposta
     }
+
+
 }

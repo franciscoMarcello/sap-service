@@ -12,13 +12,15 @@ import com.fasterxml.jackson.databind.annotation.JsonNaming
 @JsonInclude(JsonInclude.Include.NON_NULL)
 class PedidoUpdate(
     private val docEntry : String,
-    val DocumentLines: List<PedidoUpdateLine>
+    val DocumentLines: List<PedidoUpdateLine>,
+    @JsonIgnore private val docNum: String? = null
 ) : BatchId {
 
     @JsonIgnore
-    override fun getId(): String {
-        return docEntry
-    }
+    override fun getId(): String = docEntry
+
+    @JsonIgnore
+    override fun getDisplayId(): String = docNum ?: docEntry
 }
 
 

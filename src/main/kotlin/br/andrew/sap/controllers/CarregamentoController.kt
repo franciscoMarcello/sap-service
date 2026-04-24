@@ -95,26 +95,36 @@ class CarregamentoController(val carregamentoServico: CarregamentoService,
         }
 
         try {
-            val tripleAdicionar = dto.pedidos.map{
-                val order = pedidoVendaService.getById(it).tryGetValue<OrderSales>()
+            val vinculadosAtualmente = if (!isNewOrder)
+                carregamentoServico.docEntryPedido(ordemCriada.DocEntry!!).map { it.DocEntry }
+            else
+                emptyList()
 
+            val pedidosParaAdicionar = dto.pedidos.filter { it !in vinculadosAtualmente }
+            val pedidosParaRemover = vinculadosAtualmente.filter { it !in dto.pedidos }
+
+            val tripleAdicionar = pedidosParaAdicionar.map {
+                val order = pedidoVendaService.getById(it.toString()).tryGetValue<OrderSales>()
                 val pedidosUpdate = PedidoUpdate(
                     order.DocEntry.toString(),
-                    order.DocumentLines.map { PedidoUpdateLine(it.DocEntry!!,it.LineNum!!,ordemCriada.DocEntry) }
+                    order.DocumentLines.map { line -> PedidoUpdateLine(line.DocEntry!!,line.LineNum!!,ordemCriada.DocEntry) },
+                    order.docNum
                 )
                 Triple(BatchMethod.PATCH,pedidosUpdate,pedidoVendaService)
             }
 
-            val tripleRemover = dto.pedidosRemover.map{
-                val order = pedidoVendaService.getById(it).tryGetValue<OrderSales>()
-
+            val tripleRemover = pedidosParaRemover.map {
+                val order = pedidoVendaService.getById(it.toString()).tryGetValue<OrderSales>()
                 val pedidosUpdate = PedidoUpdate(
                     order.DocEntry.toString(),
-                    order.DocumentLines.map { PedidoUpdateLine(it.DocEntry!!,it.LineNum!!,null) }
+                    order.DocumentLines.map { line -> PedidoUpdateLine(line.DocEntry!!,line.LineNum!!,null) },
+                    order.docNum
                 )
                 Triple(BatchMethod.PATCH,pedidosUpdate,pedidoVendaService)
             }
-            batchService.run(BatchList().addAll(tripleAdicionar).addAll(tripleRemover))
+
+            if (tripleAdicionar.isNotEmpty() || tripleRemover.isNotEmpty())
+                batchService.run(BatchList().addAll(tripleAdicionar).addAll(tripleRemover))
         }catch (e : Exception){
             if(isNewOrder){
                 ordemCriada.also { it.U_Status = "Falhou" }
@@ -168,6 +178,8 @@ class CarregamentoController(val carregamentoServico: CarregamentoService,
                     val lotesDoItem = lotesAgrupados.find { it.ItemCode == currentItem.ItemCode }
                     if (lotesDoItem != null) {
                         currentItem.BatchNumbers = lotesDoItem.getBachesBy(currentItem)
+                    } else {
+                        logger.warn("Item sem lote no carregamento $docEntry: ItemCode=${currentItem.ItemCode} Qty=${currentItem.Quantity} Whs=${currentItem.WarehouseCode}")
                     }
                 }
         }
@@ -180,8 +192,23 @@ class CarregamentoController(val carregamentoServico: CarregamentoService,
             val seqCodeValue = sequenceCodes.firstOrNull()?.SeqCode
                 ?: throw Exception("SeqCode não encontrado para a filial $bplId")
 
-            val documento = pedido.toDocument(DocumentTypes.oInvoices, seqCodeValue)
+            val linhasDoCarregamento = pedido.DocumentLines.filter { it.U_ORD_CARREGAMENTO == docEntry }
+            logger.info("Carregamento $docEntry - Pedido ${pedido.docEntry}: ${linhasDoCarregamento.size} linhas -> " +
+                linhasDoCarregamento.joinToString { "Item=${it.ItemCode} Qty=${it.Quantity} Lotes=${it.BatchNumbers.size} Whs=${it.WarehouseCode} LineDocEntry=${it.DocEntry} LineNum=${it.LineNum}" })
+            val pedidoParaFaturar = OrderSales(pedido.CardCode, pedido.DocDueDate, linhasDoCarregamento, bplId).also { p ->
+                p.docObjectCode = pedido.docObjectCode
+                p.salesPersonCode = pedido.salesPersonCode
+                p.paymentGroupCode = pedido.paymentGroupCode
+                p.model = pedido.model
+                p.journalMemo = pedido.journalMemo
+                p.docDate = pedido.docDate
+                p.controlAccount = pedido.controlAccount
+                p.documentAdditionalExpenses = pedido.documentAdditionalExpenses.toMutableList()
+            }
 
+            val documento = pedidoParaFaturar.toDocument(DocumentTypes.oInvoices, seqCodeValue)
+
+            documento.AttachmentEntry = null
             documento.getOrCreateTaxExtension().Vehicle = carregamento.U_placa
             documento.getOrCreateTaxExtension().Carrier = carregamento.U_transportadora
             documento.ClosingRemarks = "Motorista: ${carregamento.U_motorista}. Ordem: ${carregamento.DocEntry}"

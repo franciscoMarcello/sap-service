@@ -5,4 +5,7 @@ import com.fasterxml.jackson.annotation.JsonIgnore
 interface BatchId{
     @JsonIgnore
     fun getId() : String
+
+    @JsonIgnore
+    fun getDisplayId() : String = getId()
 }
