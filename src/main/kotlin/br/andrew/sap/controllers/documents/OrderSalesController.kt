@@ -166,8 +166,8 @@ class OrderSalesController(val ordersService: OrdersService,
     }
 
     @GetMapping("/searchLocality")
-    fun searchLocalidade(@RequestParam("Code") Code: Int): NextLink<Localidade> {
-        val result = ordersService.SearchLocality(Code)
+    fun searchLocalidade(@RequestParam("search") search: String): NextLink<Localidade> {
+        val result = ordersService.SearchLocality(search)
         return result ?: NextLink(emptyList(), "")
     }
 }

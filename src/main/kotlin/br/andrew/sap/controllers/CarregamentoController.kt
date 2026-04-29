@@ -208,7 +208,7 @@ class CarregamentoController(val carregamentoServico: CarregamentoService,
 
             val documento = pedidoParaFaturar.toDocument(DocumentTypes.oInvoices, seqCodeValue)
 
-            documento.AttachmentEntry = null
+            documento.AttachmentEntry = pedido.AttachmentEntry
             documento.getOrCreateTaxExtension().Vehicle = carregamento.U_placa
             documento.getOrCreateTaxExtension().Carrier = carregamento.U_transportadora
             documento.ClosingRemarks = "Motorista: ${carregamento.U_motorista}. Ordem: ${carregamento.DocEntry}"
