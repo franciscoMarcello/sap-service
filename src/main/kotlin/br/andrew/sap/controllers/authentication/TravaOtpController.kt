@@ -3,6 +3,7 @@ package br.andrew.sap.controllers.authentication
 import br.andrew.sap.model.authentication.User
 import br.andrew.sap.services.integracao.TelegramRequestService
 import br.andrew.sap.services.security.TravaOtpService
+import br.andrew.sap.services.security.TravaRegraService
 import org.slf4j.LoggerFactory
 import org.springframework.http.HttpStatus
 import org.springframework.security.core.Authentication
@@ -28,6 +29,7 @@ import org.springframework.web.server.ResponseStatusException
 @RequestMapping("trava")
 class TravaOtpController(
     val travaOtpService: TravaOtpService,
+    val travaRegraService: TravaRegraService,
     val telegramService: TelegramRequestService,
 ) {
     private val log = LoggerFactory.getLogger(TravaOtpController::class.java)
@@ -42,6 +44,15 @@ class TravaOtpController(
             throw ResponseStatusException(HttpStatus.FORBIDDEN, "Sem permissao para gerar codigo de liberacao de trava")
 
         val regraNorm = regra.trim().uppercase()
+
+        // Desativar/apagar no catalogo tem que valer aqui tambem: sem isso, quem tem o papel
+        // ainda geraria codigo valido passando a regra direto na URL (o catalogo so escondia
+        // a opcao do select). So emite se a regra existir e estiver ATIVA em TRAVA_REGRA.
+        val regraAtiva = travaRegraService.listar(false)
+            .any { it.Code?.trim()?.uppercase() == regraNorm }
+        if (!regraAtiva)
+            throw Exception("Regra '$regraNorm' inexistente ou inativa. Cadastre ou ative em Configuracoes > Regras de Trava.")
+
         val codigo = travaOtpService.gerar(regraNorm)
         val quem = user?.let { "${it._name} (${it.id})" } ?: "desconhecido"
 
