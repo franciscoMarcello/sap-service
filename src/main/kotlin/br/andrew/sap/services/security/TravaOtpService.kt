@@ -22,10 +22,19 @@ import java.security.MessageDigest
  */
 @Service
 class TravaOtpService(
-    @Value("\${trava.otp.secret:MINHA_CHAVE_SUPER_SECRETA_2026}") private val secret: String,
+    @Value("\${trava.otp.secret}") private val secret: String,
     @Value("\${trava.otp.window-seconds:120}") private val windowSeconds: Long,
     @Value("\${trava.otp.length:6}") private val length: Int,
 ) {
+
+    init {
+        // Sem default no @Value: se trava.otp.secret nao estiver configurado, o Spring
+        // ja falha no boot. Aqui barramos tambem o valor vazio/em branco. Esses codigos
+        // burlam regras da TransactionNotification, entao nao pode haver segredo implicito.
+        require(secret.isNotBlank()) {
+            "trava.otp.secret nao configurado - defina um segredo forte (igual ao da funcao HANA fnValidaOtpBypass)"
+        }
+    }
 
     fun janelaAtual(epochSeconds: Long = System.currentTimeMillis() / 1000): Long =
         Math.floorDiv(epochSeconds, windowSeconds)
