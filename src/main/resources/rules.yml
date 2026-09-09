@@ -295,3 +295,9 @@ roles:
       actions: ["get"]
     - url: "/installment/**/paid"
       actions: ["get"]
+
+  liberacao_trava:
+    - url: "/trava/otp"
+      actions: ["get"]
+    - url: "/trava/regras"
+      actions: ["get"]
