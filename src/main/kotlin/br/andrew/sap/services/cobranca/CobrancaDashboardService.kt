@@ -36,22 +36,23 @@ class CobrancaDashboardService(val sqlQueriesService: SqlQueriesService) {
 
     @Cacheable(
         "cobranca-dashboard",
-        key = "'resumo-' + #auth.getIdInt() + '-' + #filial + '-' + #vendedor + '-' + #de + '-' + #ate + '-' + #hoje",
+        key = "'resumo-' + #auth.getIdInt() + '-' + #filiais + '-' + #vendedor + '-' + #cobrador + '-' + #de + '-' + #ate + '-' + #hoje",
     )
     fun resumo(
         auth: User,
-        filial: Int? = null,
+        filiais: List<Int>? = null,
         vendedor: Int? = null,
+        cobrador: String? = null,
         de: LocalDate,
         ate: LocalDate,
         hoje: LocalDate = LocalDate.now(),
     ): CobrancaDashboard {
-        val escopo = escopo(auth, filial, vendedor)
+        val escopos = escopos(auth, filiais, vendedor)
 
         val faixas = mutableListOf<CobrancaFaixa>()
         val carteira = mutableListOf<CobrancaAgregadoSap>()
         for (faixa in FaixaAtraso.values()) {
-            val linhas = carteiraDaFaixa(faixa, hoje, escopo)
+            val linhas = carteiraDaFaixa(faixa, hoje, escopos).doCobrador(cobrador) { it.U_Cobrador }
             carteira.addAll(linhas)
             faixas.add(
                 CobrancaFaixa(
@@ -66,31 +67,33 @@ class CobrancaDashboardService(val sqlQueriesService: SqlQueriesService) {
 
         val recuperado = buscarAgregado<CobrancaRecuperadoSap>(
             "cobranca-recuperado.sql", "cobranca-recuperado-adiantamento.sql",
-            escopo + listOf(Parameter("de", de.toString()), Parameter("ate", ate.toString())),
-        )
+            escopos, listOf(Parameter("de", de.toString()), Parameter("ate", ate.toString())),
+        ).doCobrador(cobrador) { it.U_Cobrador }
 
         val diasDoPeriodo = ChronoUnit.DAYS.between(de, ate) + 1
         val ateAnterior = de.minusDays(1)
         val deAnterior = ateAnterior.minusDays(diasDoPeriodo - 1)
         val recuperadoAnterior = buscarAgregado<CobrancaRecuperadoSap>(
             "cobranca-recuperado.sql", "cobranca-recuperado-adiantamento.sql",
-            escopo + listOf(Parameter("de", deAnterior.toString()), Parameter("ate", ateAnterior.toString())),
-        )
+            escopos, listOf(Parameter("de", deAnterior.toString()), Parameter("ate", ateAnterior.toString())),
+        ).doCobrador(cobrador) { it.U_Cobrador }
 
-        val semAcao = buscarAgregado<CobrancaAgregadoSap>(
+        // "Ninguem tocou" e ausencia de registro, logo ausencia de cobrador: escolher um
+        // cobrador zera o card em vez de repetir o numero da empresa inteira dentro do recorte.
+        val semAcao = if (cobrador != null) emptyList() else buscarAgregado<CobrancaAgregadoSap>(
             "cobranca-sem-acao.sql", "cobranca-sem-acao-adiantamento.sql",
-            escopo + listOf(Parameter("data", hoje.toString())),
+            escopos, listOf(Parameter("data", hoje.toString())),
         )
 
         val promessas = buscarAgregado<CobrancaAgregadoSap>(
             "cobranca-promessa-vencida.sql", "cobranca-promessa-vencida-adiantamento.sql",
-            escopo + listOf(Parameter("data", hoje.toString())),
-        )
+            escopos, listOf(Parameter("data", hoje.toString())),
+        ).doCobrador(cobrador) { it.U_Cobrador }
 
         val trabalhados = buscarAgregado<CobrancaTrabalhadosSap>(
             "cobranca-trabalhados.sql", "cobranca-trabalhados-adiantamento.sql",
-            escopo + listOf(Parameter("de", de.toString()), Parameter("ate", ate.toString())),
-        )
+            escopos, listOf(Parameter("de", de.toString()), Parameter("ate", ate.toString())),
+        ).doCobrador(cobrador) { it.U_Usuario }
 
         return CobrancaDashboard(
             De = de.toString(),
@@ -115,12 +118,13 @@ class CobrancaDashboardService(val sqlQueriesService: SqlQueriesService) {
 
     @Cacheable(
         "cobranca-dashboard",
-        key = "'evolucao-' + #auth.getIdInt() + '-' + #filial + '-' + #vendedor + '-' + #meses + '-' + #hoje",
+        key = "'evolucao-' + #auth.getIdInt() + '-' + #filiais + '-' + #vendedor + '-' + #cobrador + '-' + #meses + '-' + #hoje",
     )
     fun evolucao(
         auth: User,
-        filial: Int? = null,
+        filiais: List<Int>? = null,
         vendedor: Int? = null,
+        cobrador: String? = null,
         meses: Int = 6,
         hoje: LocalDate = LocalDate.now(),
     ): List<CobrancaMes> {
@@ -129,11 +133,12 @@ class CobrancaDashboardService(val sqlQueriesService: SqlQueriesService) {
 
         val dias = buscarAgregado<CobrancaRecuperadoDiaSap>(
             "cobranca-recuperado-diario.sql", "cobranca-recuperado-diario-adiantamento.sql",
-            escopo(auth, filial, vendedor) + listOf(
+            escopos(auth, filiais, vendedor),
+            listOf(
                 Parameter("de", primeiroMes.atDay(1).toString()),
                 Parameter("ate", hoje.toString()),
             ),
-        )
+        ).doCobrador(cobrador) { it.U_Cobrador }
 
         val porMes = dias.groupBy { YearMonth.from(LocalDate.parse(it.DocDate, DateTimeFormatter.BASIC_ISO_DATE)) }
 
@@ -149,20 +154,34 @@ class CobrancaDashboardService(val sqlQueriesService: SqlQueriesService) {
         }
     }
 
-    private fun escopo(auth: User, filial: Int?, vendedor: Int?): List<Parameter> {
+    /**
+     * Um conjunto de parametros por filial escolhida. As views mantem o idioma
+     * ":filial ou :filialIsFilter" (um valor so) porque lista fixa de BPLId nao tem precedente
+     * no parser do SQLQueries - mesmo motivo do laco em CobrancaConsultaService.listar.
+     *
+     * Cada filial a mais multiplica as consultas ao SAP (o resumo ja faz 18 por escopo), e por
+     * isso nenhuma filial escolhida continua sendo UMA consulta com o filtro desligado, e nao
+     * uma por filial existente.
+     */
+    private fun escopos(auth: User, filiais: List<Int>?, vendedor: Int?): List<List<Parameter>> {
         val vendedorEfetivo = CobrancaEscopo.vendedorEfetivo(auth, vendedor)
-        return listOf(
-            Parameter("filial", filial ?: Int.MAX_VALUE),
-            Parameter("filialIsFilter", if (filial == null) Int.MAX_VALUE else -1),
+        val doVendedor = listOf(
             Parameter("vendedor", vendedorEfetivo ?: Int.MAX_VALUE),
             Parameter("vendedorIsFilter", if (vendedorEfetivo == null) Int.MAX_VALUE else -1),
         )
+        return (filiais?.distinct()?.takeIf { it.isNotEmpty() } ?: listOf(null)).map { filial ->
+            listOf(
+                Parameter("filial", filial ?: Int.MAX_VALUE),
+                Parameter("filialIsFilter", if (filial == null) Int.MAX_VALUE else -1),
+            ) + doVendedor
+        }
     }
 
-    private fun carteiraDaFaixa(faixa: FaixaAtraso, hoje: LocalDate, escopo: List<Parameter>): List<CobrancaAgregadoSap> {
+    private fun carteiraDaFaixa(faixa: FaixaAtraso, hoje: LocalDate, escopos: List<List<Parameter>>): List<CobrancaAgregadoSap> {
         return buscarAgregado(
             "cobranca-carteira.sql", "cobranca-carteira-adiantamento.sql",
-            escopo + listOf(
+            escopos,
+            listOf(
                 Parameter("vencimentoDe", faixa.vencimentoDe(hoje).toString()),
                 Parameter("vencimentoAte", faixa.vencimentoAte(hoje).toString()),
             ),
@@ -172,10 +191,13 @@ class CobrancaDashboardService(val sqlQueriesService: SqlQueriesService) {
     private inline fun <reified T : Any> buscarAgregado(
         viewNotaFiscal: String,
         viewAdiantamento: String,
-        parametros: List<Parameter>,
+        escopos: List<List<Parameter>>,
+        extras: List<Parameter> = listOf(),
     ): List<T> {
-        return sqlQueriesService.getAll<T>(viewNotaFiscal, parametros) +
-            sqlQueriesService.getAll<T>(viewAdiantamento, parametros)
+        return escopos.flatMap { escopo ->
+            sqlQueriesService.getAll<T>(viewNotaFiscal, escopo + extras) +
+                sqlQueriesService.getAll<T>(viewAdiantamento, escopo + extras)
+        }
     }
 
     private fun porFilial(carteira: List<CobrancaAgregadoSap>): List<CobrancaPorFilial> {
@@ -224,6 +246,15 @@ class CobrancaDashboardService(val sqlQueriesService: SqlQueriesService) {
             )
         }.sortedByDescending { it.Recuperado }
     }
+
+    /**
+     * Filtro de cobrador fica em Kotlin de proposito. No SQL ele esbarraria no parser do
+     * SQLQueries, que recusa nao-ASCII - e nome de cobrador tem acento o tempo todo (ver
+     * soAscii em CobrancaConsultaService). Aqui o volume e de agregado, algumas dezenas de
+     * linhas por view, entao filtrar depois nao custa paginacao extra como custa na lista.
+     */
+    private fun <T> List<T>.doCobrador(cobrador: String?, nome: (T) -> String?): List<T> =
+        if (cobrador == null) this else filter { nome(it)?.trim() == cobrador }
 
     private fun String?.rotuloCobrador(): String = this?.trim().orEmpty().ifEmpty { SEM_COBRADOR }
 

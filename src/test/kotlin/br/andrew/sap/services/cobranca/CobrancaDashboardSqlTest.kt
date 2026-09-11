@@ -82,17 +82,49 @@ class CobrancaDashboardSqlTest {
     }
 
     @Test
-    fun `recuperado diario so conta pagamento que veio DEPOIS de existir acao de cobranca`() {
-        // Este EXISTS e o que separa "a cobranca trouxe de volta" de "o cliente pagou
-        // sozinho". Sem ele o dashboard credita ao time todo pagamento de titulo que por
-        // acaso tem registro - ou seja, mente a favor de quem esta sendo medido.
+    fun `recuperado diario so conta pagamento que veio DEPOIS de existir acao, e sabe de quem foi`() {
+        // Isto e o que separa "a cobranca trouxe de volta" de "o cliente pagou sozinho". Sem
+        // isso o dashboard credita ao time todo pagamento de titulo que por acaso tem registro
+        // - ou seja, mente a favor de quem esta sendo medido.
+        //
+        // Era um EXISTS simples ("existe alguma acao anterior ao pagamento"). Virou o mesmo par
+        // INNER JOIN + NOT EXISTS do cobranca-recuperado.sql: o JOIN ja exige a acao anterior
+        // (o EXISTS ficou redundante) e o NOT EXISTS isola a linha de historico vigente na data
+        // do pagamento, que e de onde sai o U_Cobrador. Sem o cobrador aqui, o filtro de
+        // cobrador do dashboard valeria nos cards e nao no grafico de evolucao - e filtro que
+        // so parte da tela obedece e exatamente o que o teste de filial/vendedor proibe.
         listOf("cobranca-recuperado-diario.sql", "cobranca-recuperado-diario-adiantamento.sql").forEach { nome ->
+            val sql = views.getValue(nome)
             assertTrue(
-                views.getValue(nome).contains(
-                    "EXISTS(SELECT 1 FROM \"@COB_TITULO_L\" H WHERE H.\"Code\" = C.\"Code\" AND H.\"U_Data\" <= r.\"DocDate\")"
-                ),
-                "$nome perdeu o EXISTS que exige acao registrada antes do pagamento"
+                sql.contains("INNER JOIN \"@COB_TITULO_L\" H"),
+                "$nome nao exige mais acao registrada antes do pagamento"
             )
+            assertTrue(
+                sql.contains("H.\"Code\" = C.\"Code\" AND H.\"U_Data\" <= r.\"DocDate\""),
+                "$nome perdeu a condicao de acao anterior ao pagamento"
+            )
+            assertTrue(
+                sql.contains("H2.\"U_Data\" > H.\"U_Data\" OR (H2.\"U_Data\" = H.\"U_Data\" AND H2.\"LineId\" > H.\"LineId\")"),
+                "$nome nao restringe a linha de historico mais recente antes do pagamento"
+            )
+            assertTrue(
+                sql.contains("H.\"U_Cobrador\""),
+                "$nome deve trazer o cobrador da linha de historico, nao o do registro mestre"
+            )
+            assertFalse(
+                sql.contains("C.\"U_Cobrador\""),
+                "$nome nao pode ler o cobrador do mestre - ele muda se o titulo for reatribuido"
+            )
+        }
+    }
+
+    @Test
+    fun `carteira expoe o cobrador pro filtro do dashboard`() {
+        // O filtro de cobrador e aplicado em Kotlin (nome com acento nao passa no parser do
+        // SQLQueries), entao a coluna precisa vir na resposta e no GROUP BY - sem ela o
+        // CobrancaAgregadoSap chega com U_Cobrador nulo e o filtro zera a carteira inteira.
+        listOf("cobranca-carteira.sql", "cobranca-carteira-adiantamento.sql").forEach { nome ->
+            assertTrue(views.getValue(nome).contains("C.\"U_Cobrador\""), nome)
         }
     }
 

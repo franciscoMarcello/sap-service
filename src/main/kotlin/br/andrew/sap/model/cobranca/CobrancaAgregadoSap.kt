@@ -52,6 +52,7 @@ class CobrancaTrabalhadosSap(
 @JsonInclude(JsonInclude.Include.NON_EMPTY)
 class CobrancaRecuperadoDiaSap(
     val DocDate: String,
+    val U_Cobrador: String? = null,
     val Recuperado: BigDecimal? = null,
     val DocEntry: Int,
 ) {

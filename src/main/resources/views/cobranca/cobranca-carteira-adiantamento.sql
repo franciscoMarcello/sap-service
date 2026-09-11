@@ -1,6 +1,6 @@
 SELECT
     T0."BPLId", T0."BPLName",
-    C."U_Status",
+    C."U_Status", C."U_Cobrador",
     sum(P."InsTotal")   AS "Total",
     sum(P."PaidToDate") AS "Pago",
     count(P."InstlmntID") AS "Parcelas"
@@ -18,4 +18,4 @@ WHERE
     AND (T0."SlpCode" = :vendedor OR T0."SlpCode" < :vendedorIsFilter)
     AND T0."CardCode" NOT IN (SELECT "DflCust" FROM OBPL WHERE "DflCust" IS NOT NULL)
 GROUP BY
-    T0."BPLId", T0."BPLName", C."U_Status"
+    T0."BPLId", T0."BPLName", C."U_Status", C."U_Cobrador"
