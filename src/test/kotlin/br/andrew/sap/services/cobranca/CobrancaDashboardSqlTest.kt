@@ -189,6 +189,30 @@ class CobrancaDashboardSqlTest {
     }
 
     @Test
+    fun `agregado do dashboard so conta parcela que ainda tem saldo a receber`() {
+        // InsTotal <> 0 deixava passar parcela de valor negativo, parcela ja quitada com
+        // Status ainda 'O' e parcela de saldo negativo - 10 parcelas na matriz que o
+        // "Contas a Receber" do SAP nao lista. Conferido em set/2026: com esse filtro a
+        // carteira da matriz fecha em 500 parcelas e R$ 4.704.445,31, igual ao relatorio.
+        //
+        // Compara as duas colunas em vez de subtrair (precedente: o par H2/H de
+        // cobranca-recuperado.sql). Subtrair traria de volta o risco que o teste vizinho
+        // guarda: sem IFNULL - proibido pelo parser - um PaidToDate nulo envenena a conta.
+        //
+        // Nao vale pras views de titulos: la a parcela quitada que teve cobranca precisa
+        // continuar aparecendo pro cobrador ver o que ele recuperou.
+        listOf(
+            "cobranca-carteira.sql", "cobranca-carteira-adiantamento.sql",
+            "cobranca-sem-acao.sql", "cobranca-sem-acao-adiantamento.sql",
+            "cobranca-promessa-vencida.sql", "cobranca-promessa-vencida-adiantamento.sql",
+        ).forEach { nome ->
+            val sql = views.getValue(nome)
+            assertTrue(sql.contains("P.\"InsTotal\" > P.\"PaidToDate\""), nome)
+            assertFalse(sql.contains("P.\"InsTotal\" <> 0"), "$nome ainda usa o filtro antigo")
+        }
+    }
+
+    @Test
     fun `carteira e sem-acao olham so parcela aberta`() {
         listOf(
             "cobranca-carteira.sql", "cobranca-carteira-adiantamento.sql",
