@@ -47,3 +47,11 @@ jobs.aprovacao-automatica.enable=false
 jobs.fluxo-prazo.enable=false
 # Atualizacao da cotacao de moeda no Bacen (CurrencyScheduled) - diaria a meia-noite
 jobs.cotacao-moeda.enable=false
+
+# OTP de liberacao das travas (TransactionNotification). Deve ser IGUAL ao segredo
+# da funcao HANA fnValidaOtpBypass (repo sap-sql-sovis). Troque em producao.
+trava.otp.secret=TROCAR_ESTE_SEGREDO
+trava.otp.window-seconds=120
+trava.otp.length=6
+# Provisiona/semeia o catalogo de regras de trava (UDO TRAVA_REGRA) no boot.
+fields.trava=true
