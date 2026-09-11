@@ -47,12 +47,15 @@ class CobrancaDashboardService(val sqlQueriesService: SqlQueriesService) {
         ate: LocalDate,
         hoje: LocalDate = LocalDate.now(),
     ): CobrancaDashboard {
-        val escopos = escopos(auth, filiais, vendedor)
+        val escopo = escopo(auth, vendedor)
+        val recorteDeFilial = filiais?.distinct()?.takeIf { it.isNotEmpty() }?.toSet()
 
         val faixas = mutableListOf<CobrancaFaixa>()
         val carteira = mutableListOf<CobrancaAgregadoSap>()
         for (faixa in FaixaAtraso.values()) {
-            val linhas = carteiraDaFaixa(faixa, hoje, escopos).doCobrador(cobrador) { it.U_Cobrador }
+            val linhas = carteiraDaFaixa(faixa, hoje, escopo)
+                .daFilial(recorteDeFilial) { it.BPLId }
+                .doCobrador(cobrador) { it.U_Cobrador }
             carteira.addAll(linhas)
             faixas.add(
                 CobrancaFaixa(
@@ -67,33 +70,33 @@ class CobrancaDashboardService(val sqlQueriesService: SqlQueriesService) {
 
         val recuperado = buscarAgregado<CobrancaRecuperadoSap>(
             "cobranca-recuperado.sql", "cobranca-recuperado-adiantamento.sql",
-            escopos, listOf(Parameter("de", de.toString()), Parameter("ate", ate.toString())),
-        ).doCobrador(cobrador) { it.U_Cobrador }
+            escopo + listOf(Parameter("de", de.toString()), Parameter("ate", ate.toString())),
+        ).daFilial(recorteDeFilial) { it.BPLId }.doCobrador(cobrador) { it.U_Cobrador }
 
         val diasDoPeriodo = ChronoUnit.DAYS.between(de, ate) + 1
         val ateAnterior = de.minusDays(1)
         val deAnterior = ateAnterior.minusDays(diasDoPeriodo - 1)
         val recuperadoAnterior = buscarAgregado<CobrancaRecuperadoSap>(
             "cobranca-recuperado.sql", "cobranca-recuperado-adiantamento.sql",
-            escopos, listOf(Parameter("de", deAnterior.toString()), Parameter("ate", ateAnterior.toString())),
-        ).doCobrador(cobrador) { it.U_Cobrador }
+            escopo + listOf(Parameter("de", deAnterior.toString()), Parameter("ate", ateAnterior.toString())),
+        ).daFilial(recorteDeFilial) { it.BPLId }.doCobrador(cobrador) { it.U_Cobrador }
 
         // "Ninguem tocou" e ausencia de registro, logo ausencia de cobrador: escolher um
         // cobrador zera o card em vez de repetir o numero da empresa inteira dentro do recorte.
         val semAcao = if (cobrador != null) emptyList() else buscarAgregado<CobrancaAgregadoSap>(
             "cobranca-sem-acao.sql", "cobranca-sem-acao-adiantamento.sql",
-            escopos, listOf(Parameter("data", hoje.toString())),
-        )
+            escopo + listOf(Parameter("data", hoje.toString())),
+        ).daFilial(recorteDeFilial) { it.BPLId }
 
         val promessas = buscarAgregado<CobrancaAgregadoSap>(
             "cobranca-promessa-vencida.sql", "cobranca-promessa-vencida-adiantamento.sql",
-            escopos, listOf(Parameter("data", hoje.toString())),
-        ).doCobrador(cobrador) { it.U_Cobrador }
+            escopo + listOf(Parameter("data", hoje.toString())),
+        ).daFilial(recorteDeFilial) { it.BPLId }.doCobrador(cobrador) { it.U_Cobrador }
 
         val trabalhados = buscarAgregado<CobrancaTrabalhadosSap>(
             "cobranca-trabalhados.sql", "cobranca-trabalhados-adiantamento.sql",
-            escopos, listOf(Parameter("de", de.toString()), Parameter("ate", ate.toString())),
-        ).doCobrador(cobrador) { it.U_Usuario }
+            escopo + listOf(Parameter("de", de.toString()), Parameter("ate", ate.toString())),
+        ).daFilial(recorteDeFilial) { it.BPLId }.doCobrador(cobrador) { it.U_Usuario }
 
         return CobrancaDashboard(
             De = de.toString(),
@@ -133,12 +136,12 @@ class CobrancaDashboardService(val sqlQueriesService: SqlQueriesService) {
 
         val dias = buscarAgregado<CobrancaRecuperadoDiaSap>(
             "cobranca-recuperado-diario.sql", "cobranca-recuperado-diario-adiantamento.sql",
-            escopos(auth, filiais, vendedor),
-            listOf(
+            escopo(auth, vendedor) + listOf(
                 Parameter("de", primeiroMes.atDay(1).toString()),
                 Parameter("ate", hoje.toString()),
             ),
-        ).doCobrador(cobrador) { it.U_Cobrador }
+        ).daFilial(filiais?.distinct()?.takeIf { it.isNotEmpty() }?.toSet()) { it.BPLId }
+            .doCobrador(cobrador) { it.U_Cobrador }
 
         val porMes = dias.groupBy { YearMonth.from(LocalDate.parse(it.DocDate, DateTimeFormatter.BASIC_ISO_DATE)) }
 
@@ -155,33 +158,33 @@ class CobrancaDashboardService(val sqlQueriesService: SqlQueriesService) {
     }
 
     /**
-     * Um conjunto de parametros por filial escolhida. As views mantem o idioma
-     * ":filial ou :filialIsFilter" (um valor so) porque lista fixa de BPLId nao tem precedente
-     * no parser do SQLQueries - mesmo motivo do laco em CobrancaConsultaService.listar.
+     * O filtro de filial NAO vai pro SQL: o recorte e feito em Kotlin, pelo BPLId que toda view
+     * do dashboard devolve. Uma passada por filial escolhida custava 18 consultas ao SAP por
+     * filial - com as 18 da empresa marcadas, mais de 300 chamadas sequenciais pra montar uma
+     * tela. Assim o custo fica constante: 18 consultas, escolha o usuario uma filial ou todas.
      *
-     * Cada filial a mais multiplica as consultas ao SAP (o resumo ja faz 18 por escopo), e por
-     * isso nenhuma filial escolhida continua sendo UMA consulta com o filtro desligado, e nao
-     * uma por filial existente.
+     * De quebra some o multiplicador: filial e lista que vem da requisicao, entao sem isso uma
+     * chamada com centenas de IDs (inclusive inexistentes) inundava o Service Layer, que e
+     * recurso compartilhado. Agora 500 IDs na URL custam o mesmo que um.
+     *
+     * Os parametros continuam sendo enviados, sempre "sem filtro", porque as views mantem o
+     * idioma ":filial ou :filialIsFilter" - e o teste que exige filtro opcional de filial e
+     * vendedor em toda view do dashboard continua valendo.
      */
-    private fun escopos(auth: User, filiais: List<Int>?, vendedor: Int?): List<List<Parameter>> {
+    private fun escopo(auth: User, vendedor: Int?): List<Parameter> {
         val vendedorEfetivo = CobrancaEscopo.vendedorEfetivo(auth, vendedor)
-        val doVendedor = listOf(
+        return listOf(
+            Parameter("filial", Int.MAX_VALUE),
+            Parameter("filialIsFilter", Int.MAX_VALUE),
             Parameter("vendedor", vendedorEfetivo ?: Int.MAX_VALUE),
             Parameter("vendedorIsFilter", if (vendedorEfetivo == null) Int.MAX_VALUE else -1),
         )
-        return (filiais?.distinct()?.takeIf { it.isNotEmpty() } ?: listOf(null)).map { filial ->
-            listOf(
-                Parameter("filial", filial ?: Int.MAX_VALUE),
-                Parameter("filialIsFilter", if (filial == null) Int.MAX_VALUE else -1),
-            ) + doVendedor
-        }
     }
 
-    private fun carteiraDaFaixa(faixa: FaixaAtraso, hoje: LocalDate, escopos: List<List<Parameter>>): List<CobrancaAgregadoSap> {
+    private fun carteiraDaFaixa(faixa: FaixaAtraso, hoje: LocalDate, escopo: List<Parameter>): List<CobrancaAgregadoSap> {
         return buscarAgregado(
             "cobranca-carteira.sql", "cobranca-carteira-adiantamento.sql",
-            escopos,
-            listOf(
+            escopo + listOf(
                 Parameter("vencimentoDe", faixa.vencimentoDe(hoje).toString()),
                 Parameter("vencimentoAte", faixa.vencimentoAte(hoje).toString()),
             ),
@@ -191,13 +194,10 @@ class CobrancaDashboardService(val sqlQueriesService: SqlQueriesService) {
     private inline fun <reified T : Any> buscarAgregado(
         viewNotaFiscal: String,
         viewAdiantamento: String,
-        escopos: List<List<Parameter>>,
-        extras: List<Parameter> = listOf(),
+        parametros: List<Parameter>,
     ): List<T> {
-        return escopos.flatMap { escopo ->
-            sqlQueriesService.getAll<T>(viewNotaFiscal, escopo + extras) +
-                sqlQueriesService.getAll<T>(viewAdiantamento, escopo + extras)
-        }
+        return sqlQueriesService.getAll<T>(viewNotaFiscal, parametros) +
+            sqlQueriesService.getAll<T>(viewAdiantamento, parametros)
     }
 
     private fun porFilial(carteira: List<CobrancaAgregadoSap>): List<CobrancaPorFilial> {
@@ -253,6 +253,13 @@ class CobrancaDashboardService(val sqlQueriesService: SqlQueriesService) {
      * soAscii em CobrancaConsultaService). Aqui o volume e de agregado, algumas dezenas de
      * linhas por view, entao filtrar depois nao custa paginacao extra como custa na lista.
      */
+    /**
+     * Recorte de filial, tambem em Kotlin - ver escopo(). Nulo e "todas": nenhuma filial
+     * escolhida nao vira lista vazia, senao o dashboard voltaria zerado em vez de completo.
+     */
+    private fun <T> List<T>.daFilial(filiais: Set<Int>?, bplId: (T) -> Int?): List<T> =
+        if (filiais == null) this else filter { bplId(it) in filiais }
+
     private fun <T> List<T>.doCobrador(cobrador: String?, nome: (T) -> String?): List<T> =
         if (cobrador == null) this else filter { nome(it)?.trim() == cobrador }
 

@@ -1,5 +1,6 @@
 SELECT
     r."DocDate",
+    NS."BPLId",
     H."U_Cobrador",
     l."SumApplied" AS "Recuperado",
     NS."DocEntry"

@@ -36,6 +36,11 @@ class CobrancaConsultaService(val sqlQueriesService: SqlQueriesService) {
      * 400 code 704 "Parameter error.". Testado contra o Service Layer - vale pra UTF-8 e pra
      * Latin-1, nao existe encoding que passe. Espaco nao e problema, so o acento.
      *
+     * O apostrofo tambem fica de fora, por outro motivo: Parameter.toString() envolve o valor
+     * em aspas simples e so pula isso quando o valor COMECA com uma. Um apostrofo no meio
+     * ("O'Brien", "D'Avila") produz cobrador='O'Brien', que o parser recusa - a consulta falha
+     * em vez de so ficar lenta. Sem ele no SQL, o nome e filtrado em Kotlin e a tela funciona.
+     *
      * Rotulo de dominio ("8 - EM NEGOCIAÇÃO", "4 - LIGAÇÃO") e nome de cobrador tem acento o
      * tempo todo, entao esses filtros nao podem ir crus. Quando o valor tem acento a comparacao
      * sai do SQL e fica so em passaNosFiltrosLocais, que ja aplica exatamente o mesmo criterio -
@@ -43,7 +48,7 @@ class CobrancaConsultaService(val sqlQueriesService: SqlQueriesService) {
      * estourar erro na cara do cobrador.
      */
     private fun soAscii(valor: String?): String? =
-        valor?.takeIf { texto -> texto.all { it.code in 32..126 } }
+        valor?.takeIf { texto -> texto.all { it.code in 32..126 && it != '\'' } }
 
     /**
      * Prefixo ASCII do valor, pra LIKE. Quando soAscii recusa o valor, o filtro sai do SQL
@@ -63,7 +68,7 @@ class CobrancaConsultaService(val sqlQueriesService: SqlQueriesService) {
      */
     private fun prefixoLike(valor: String?): String? {
         if (valor == null || soAscii(valor) != null) return null
-        val prefixo = valor.takeWhile { it.code in 32..126 && it != '%' && it != '_' }
+        val prefixo = valor.takeWhile { it.code in 32..126 && it != '%' && it != '_' && it != '\'' }
         return if (prefixo.length < 2) null else "$prefixo%"
     }
 

@@ -210,6 +210,17 @@ class CobrancaDashboardSqlTest {
     }
 
     @Test
+    fun `toda view do dashboard devolve a filial, que e por onde o recorte e feito`() {
+        // O filtro de filial nao vai mais pro SQL: uma passada por filial escolhida custava 18
+        // consultas ao SAP por filial (mais de 300 com as 18 da empresa marcadas), e como filial
+        // e lista vinda da requisicao, o multiplicador tambem era abusavel. Agora e uma passada
+        // so e o recorte sai em Kotlin pelo BPLId - que por isso toda view precisa devolver.
+        views.forEach { (nome, sql) ->
+            assertTrue(sql.contains("\"BPLId\""), "$nome nao devolve BPLId, o recorte de filial nao tem por onde sair")
+        }
+    }
+
+    @Test
     fun `toda view do dashboard aceita o filtro opcional de filial e vendedor`() {
         // Filtro dentro de card de grafico e anti-padrao: a tela tem UMA linha de filtro e
         // todos os numeros obedecem o mesmo recorte. Se uma view ignorasse filial, um card

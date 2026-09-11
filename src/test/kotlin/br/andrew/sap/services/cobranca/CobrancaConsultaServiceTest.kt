@@ -137,6 +137,23 @@ class CobrancaConsultaServiceTest {
     }
 
     @Test
+    fun `apostrofo nao vai pro SQL por nenhum dos dois caminhos`() {
+        // Parameter.toString() envolve o valor em aspas simples e so pula isso quando ele COMECA
+        // com uma. Apostrofo no meio produz cobrador='O'Brien' / cobradorPrefixo='D'%', que o
+        // parser recusa - a consulta falha em vez de so ficar lenta. Os dois nomes tem que cair
+        // no filtro em Kotlin, que compara o valor original e devolve a lista certa.
+        whenever(sqlQueriesService.execute(eq("cobranca-titulos.sql"), any<List<Parameter>>())).thenReturn(odataVazia())
+
+        service.listar(admin, cobrador = "O'Brien", situacao = "D'Ávila")
+
+        val parametros = capturarParametros()
+        assertEquals(Int.MAX_VALUE, parametros["cobradorIsFilter"])
+        assertEquals(Int.MAX_VALUE, parametros["cobradorPrefixoIsFilter"])
+        assertEquals(Int.MAX_VALUE, parametros["situacaoIsFilter"])
+        assertEquals(Int.MAX_VALUE, parametros["situacaoPrefixoIsFilter"])
+    }
+
+    @Test
     fun `valor que ja passa inteiro no SQL nao ganha filtro de prefixo redundante`() {
         whenever(sqlQueriesService.execute(eq("cobranca-titulos.sql"), any<List<Parameter>>())).thenReturn(odataVazia())
 
