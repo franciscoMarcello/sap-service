@@ -317,3 +317,20 @@ roles:
       actions: ["get"]
     - url: "/trava/regras"
       actions: ["get"]
+
+  # Download em lote do DANFE e do XML das NF-e de saida (Financeiro > Notas e XML em lote).
+  # Perfil proprio: quem baixa nota de todos os clientes nao precisa ser vendedor nem cobranca.
+  nota_fiscal_lote:
+    - url: "/nota-fiscal-lote"
+      actions: ["get"]
+    - url: "/nota-fiscal-lote/status-sefaz"
+      actions: ["get"]
+    - url: "/nota-fiscal-lote/download"
+      actions: ["post"]
+    # Busca de cliente da propria tela, sem o recorte de carteira do /business-partners/search.
+    - url: "/nota-fiscal-lote/clientes/search"
+      actions: ["post"]
+    - url: "/branch"
+      actions: ["get"]
+    - url: "/sales-person/search"
+      actions: ["*"]

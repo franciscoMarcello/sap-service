@@ -1,0 +1,376 @@
+package br.andrew.sap.services.fiscal
+
+import br.andrew.sap.model.fiscal.NotaFiscalLoteArquivo
+import br.andrew.sap.model.fiscal.NotaFiscalLoteFiltro
+import br.andrew.sap.model.fiscal.NotaFiscalResumo
+import br.andrew.sap.model.fiscal.StatusSefaz
+import br.andrew.sap.services.odbc.OdbcClient
+import br.andrew.sap.services.odbc.SqlResource
+import org.slf4j.LoggerFactory
+import org.springframework.beans.factory.annotation.Value
+import org.springframework.data.domain.Page
+import org.springframework.data.domain.PageImpl
+import org.springframework.data.domain.PageRequest
+import org.springframework.data.domain.Pageable
+import org.springframework.stereotype.Service
+import com.fasterxml.jackson.core.JsonProcessingException
+import org.springframework.web.client.HttpStatusCodeException
+import org.springframework.web.client.ResourceAccessException
+import java.io.BufferedOutputStream
+import java.io.IOException
+import java.nio.file.Files
+import java.time.LocalDate
+import java.time.LocalDateTime
+import java.time.format.DateTimeFormatter
+import java.util.concurrent.ExecutorCompletionService
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import java.util.zip.ZipEntry
+import java.util.zip.ZipOutputStream
+
+/**
+ * Download em lote do DANFE (pdf), do XML e dos boletos das NF-e de saida emitidas para a SEFAZ.
+ *
+ * A listagem vem do sap-odbc porque precisa da "Process" da TaxPlus (chave de acesso e status
+ * na SEFAZ), que o Service Layer nao expoe. DANFE e XML vem da TaxPlus (uma consulta por nota
+ * mais uma chamada por arquivo) e o boleto da BankPlus (uma lista por nota mais um pdf por
+ * parcela); por isso o lote tem teto e roda em paralelo.
+ */
+@Service
+class NotaFiscalLoteService(
+    val odbc: OdbcClient,
+    val taxNfeService: TaxNfeService,
+    val bankPlusService: BankPlusService,
+    @Value("\${nota-fiscal.lote.maximo:200}") val maximo: Int,
+    @Value("\${nota-fiscal.lote.paralelismo:4}") val paralelismo: Int,
+    // Teto do lote inteiro. O RestTemplate da BankPlus nao tem timeout de leitura: sem isso uma
+    // resposta pendurada prenderia a requisicao para sempre.
+    @Value("\${nota-fiscal.lote.prazo-segundos:300}") val prazoSegundos: Long = 300,
+) {
+
+    private val logger = LoggerFactory.getLogger(NotaFiscalLoteService::class.java)
+
+    private val sqlNotas by lazy { SqlResource.carregar("odbc/nota-fiscal-lote.sql") }
+    private val sqlStatusSefaz by lazy { SqlResource.carregar("odbc/nota-fiscal-lote-status-sefaz.sql") }
+
+    fun listar(filtro: NotaFiscalLoteFiltro, page: Pageable): Page<NotaFiscalResumo> {
+        // "Selecionar todas do filtro" pede uma pagina do tamanho do teto; acima disso nao baixaria.
+        val pagina = if (page.pageSize > maximo) PageRequest.of(page.pageNumber, maximo) else page
+        val inicio = pagina.pageNumber * pagina.pageSize
+        val linhas = odbc.consultar(sqlNotas, parametros(filtro, listOf(), inicio, inicio + pagina.pageSize),
+            pagina.pageSize).rows
+        // O total vem em toda linha (COUNT(*) OVER ()). Pagina alem da ultima volta vazia e sem
+        // total: conta de novo pela primeira linha em vez de inventar a partir do deslocamento.
+        val total = linhas.firstOrNull()?.let(::total)
+            ?: if (inicio == 0) 0L else odbc.consultar(sqlNotas, parametros(filtro, listOf(), 0, 1), 1).rows.firstOrNull()?.let(::total) ?: 0L
+        return PageImpl(linhas.map { NotaFiscalResumo.from(it) }, pagina, total)
+    }
+
+    private fun total(linha: Map<String, Any?>): Long = linha["Total"].toString().toBigDecimal().toLong()
+
+    fun statusSefaz(): List<StatusSefaz> {
+        return odbc.consultar(sqlStatusSefaz, mapOf(), 1000).rows.map {
+            StatusSefaz(it["Id"].toString().toBigDecimal().toInt(), it["Descricao"]?.toString())
+        }
+    }
+
+    fun parametros(filtro: NotaFiscalLoteFiltro, docEntries: List<Int>, inicio: Int, fim: Int): Map<String, Any?> {
+        val filiais = filtro.filial.orEmpty()
+        // Sem data na tela, faixa larga em vez de filtro opcional: comparar DATE com '' no
+        // HANA e erro de conversao, mesmo do lado do OR que nao seria avaliado.
+        val dataInicial = data(filtro.dataInicial, "1900-01-01")
+        val dataFinal = data(filtro.dataFinal, "2999-12-31")
+        val vencimentoDe = data(filtro.vencimentoDe, "1900-01-01")
+        val vencimentoAte = data(filtro.vencimentoAte, "2999-12-31")
+        if (dataInicial > dataFinal)
+            throw Exception("A data de emissao inicial e depois da final.")
+        if (vencimentoDe > vencimentoAte)
+            throw Exception("O vencimento inicial e depois do final.")
+        if (filtro.numeroDe != null && filtro.numeroAte != null && filtro.numeroDe > filtro.numeroAte)
+            throw Exception("A NF inicial e maior que a final.")
+        val semVencimento = filtro.vencimentoDe.isNullOrBlank() && filtro.vencimentoAte.isNullOrBlank()
+        return mapOf(
+            "dataInicial" to dataInicial,
+            "dataFinal" to dataFinal,
+            "todasFiliais" to if (filiais.isEmpty()) 1 else 0,
+            "filiais" to filiais.ifEmpty { listOf(-1) },
+            "todosDocs" to if (docEntries.isEmpty()) 1 else 0,
+            "docEntries" to docEntries.ifEmpty { listOf(-1) },
+            "cardCode" to (filtro.cardCode?.trim() ?: ""),
+            "vendedor" to (filtro.salesPersonCode ?: -1),
+            "numeroDe" to (filtro.numeroDe ?: -1),
+            "numeroAte" to (filtro.numeroAte ?: -1),
+            "todosVencimentos" to if (semVencimento) 1 else 0,
+            "vencimentoDe" to vencimentoDe,
+            "vencimentoAte" to vencimentoAte,
+            "statusSap" to (filtro.statusSap?.name ?: ""),
+            "statusSefaz" to (filtro.statusSefaz ?: -1),
+            "inicio" to inicio,
+            "fim" to fim,
+        )
+    }
+
+    // Volta a data validada em AAAA-MM-DD; vazia vira o limite da faixa larga.
+    private fun data(valor: String?, padrao: String): String {
+        val data = valor?.takeIf { it.isNotBlank() }?.trim() ?: return padrao
+        try {
+            return LocalDate.parse(data).toString()
+        } catch (t: Throwable) {
+            throw Exception("Data invalida: '$data'. Use o formato AAAA-MM-DD.")
+        }
+    }
+
+    /**
+     * Monta o zip num arquivo temporario, escrevendo cada nota assim que ela termina e soltando
+     * os bytes: a memoria fica proporcional as notas em andamento, nao ao lote inteiro (200 notas
+     * com DANFE, XML e boletos passam de 40 MB). Quem chama apaga o arquivo depois de enviar.
+     */
+    fun zip(docEntries: List<Int>, pdf: Boolean, xml: Boolean, boleto: Boolean = false): NotaFiscalLoteArquivo {
+        val pedidas = docEntries.distinct()
+        if (pedidas.isEmpty())
+            throw Exception("Selecione ao menos uma nota fiscal.")
+        if (!pdf && !xml && !boleto)
+            throw Exception("Escolha baixar o DANFE, o XML, o boleto ou mais de um.")
+        if (pedidas.size > maximo)
+            throw Exception("O lote aceita no maximo $maximo notas por vez; foram selecionadas ${pedidas.size}.")
+
+        // O prazo limita os downloads e conta desde ja. A busca das notas e o carregamento da
+        // BankPlus sao sincronos e nao sao interrompidos por ele, mas tem limite proprio (timeout
+        // do sap-odbc e da leitura da BankPlus); se passarem do prazo, as notas saem todas como
+        // "tempo esgotado" sem esperar mais nada.
+        val prazo = System.nanoTime() + TimeUnit.SECONDS.toNanos(prazoSegundos)
+        // Busca de novo em vez de confiar no que veio da tela: so entra NF-e emitida para a
+        // SEFAZ, e o nome do arquivo sai do numero da nota.
+        val porDocEntry = buscaNotas(pedidas).associateBy { it.docEntry }
+        val notas = pedidas.mapNotNull { porDocEntry[it] }
+        // Nome decidido antes do paralelo e na ordem pedida: a nota que termina primeiro nao
+        // pega o nome sem sufixo de outra com o mesmo numero.
+        val bases = mutableSetOf<String>()
+        val basePorDoc = notas.associate { it.docEntry to nomeUnico(nomeBase(it), bases) }
+        val bankPlusDisponivel = !boleto || carregaEmpresasBankPlus()
+
+        val emPastas = listOf(pdf, xml, boleto).count { it } > 1
+        val caminhos = mutableSetOf<String>()
+        val errosPorDoc = mutableMapOf<Int, List<String>>()
+        val avisosPorDoc = mutableMapOf<Int, List<String>>()
+        var notasSemBoleto = 0
+        val arquivo = Files.createTempFile("notas-fiscais-", ".zip")
+        try {
+            ZipOutputStream(BufferedOutputStream(Files.newOutputStream(arquivo))).use { zip ->
+                baixaEmParalelo(notas, prazo, { nota -> baixa(nota, pdf, xml, boleto, bankPlusDisponivel) }) { resultado ->
+                    val base = basePorDoc.getValue(resultado.nota.docEntry)
+                    resultado.arquivos.forEach { item ->
+                        val pasta = if (emPastas) "${item.tipo.pasta}/" else ""
+                        val caminho = nomeUnico("$pasta$base${item.sufixo}", caminhos)
+                        zip.putNextEntry(ZipEntry("$caminho.${item.tipo.extensao}"))
+                        zip.write(item.conteudo)
+                        zip.closeEntry()
+                    }
+                    errosPorDoc[resultado.nota.docEntry] = resultado.erros.map { "$base: $it" }
+                    avisosPorDoc[resultado.nota.docEntry] = resultado.avisos.map { "$base: $it" }
+                    if (resultado.semBoleto) notasSemBoleto++
+                }
+                // Na ordem pedida, nao na de conclusao, para o arquivo ser legivel.
+                val erros = pedidas.flatMap { doc ->
+                    if (doc !in porDocEntry) listOf("DocEntry $doc: nota nao encontrada ou nao foi emitida para a SEFAZ")
+                    else errosPorDoc[doc].orEmpty()
+                }
+                val avisos = pedidas.flatMap { avisosPorDoc[it].orEmpty() }
+                if (erros.isNotEmpty())
+                    zip.texto("erros.txt", erros)
+                if (avisos.isNotEmpty())
+                    zip.texto("avisos.txt", avisos)
+            }
+        } catch (t: Throwable) {
+            Files.deleteIfExists(arquivo)
+            throw t
+        }
+        val notasComErro = (pedidas.size - notas.size) + errosPorDoc.values.count { it.isNotEmpty() }
+        val nome = "notas-fiscais-${LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMdd-HHmm"))}.zip"
+        return NotaFiscalLoteArquivo(nome, arquivo, notasComErro, notasSemBoleto)
+    }
+
+    private fun ZipOutputStream.texto(nome: String, linhas: List<String>) {
+        putNextEntry(ZipEntry(nome))
+        write(linhas.joinToString("\r\n", postfix = "\r\n").toByteArray())
+        closeEntry()
+    }
+
+    private fun buscaNotas(docEntries: List<Int>): List<NotaFiscalResumo> {
+        return odbc.consultar(sqlNotas, parametros(NotaFiscalLoteFiltro(), docEntries, 0, docEntries.size),
+            docEntries.size).rows.map { NotaFiscalResumo.from(it) }
+    }
+
+    // O cache de empresas da BankPlus e estatico e sem trava: com ele vazio, as tarefas
+    // paralelas buscariam /empresas cada uma. Carrega uma vez antes; se falhar, nenhuma nota
+    // tenta de novo (seriam ate 200 chamadas a um servico que acabou de falhar) - o boleto de
+    // cada uma vira erro. Os GETs da BankPlus tem timeout de leitura (BankPlusService).
+    private fun carregaEmpresasBankPlus(): Boolean {
+        return try {
+            bankPlusService.getEmpresas(comPrazo = true)
+            true
+        } catch (t: Throwable) {
+            logger.warn("Lote NF: falha ao carregar empresas da BankPlus", t)
+            false
+        }
+    }
+
+    /**
+     * Entrega cada nota a [escreve] na ordem em que termina; quem escreve solta os bytes antes da
+     * proxima. Estourado o prazo, o que nao terminou e cancelado
+     * e vira erro "tempo esgotado" - o resto do zip sai normalmente. A interrupcao nao derruba
+     * uma leitura de socket em andamento; ela termina pelo timeout de leitura de cada cliente HTTP
+     * (OkHttp da TaxPlus, GETs da BankPlus). Threads daemon para isso nao segurar a JVM.
+     */
+    private fun baixaEmParalelo(notas: List<NotaFiscalResumo>, prazo: Long,
+                                tarefa: (NotaFiscalResumo) -> ResultadoNota, escreve: (ResultadoNota) -> Unit) {
+        if (notas.isEmpty())
+            return
+        val pool = Executors.newFixedThreadPool(paralelismo.coerceIn(1, notas.size)) { trabalho ->
+            Thread(trabalho, "nota-fiscal-lote").also { it.isDaemon = true }
+        }
+        val conclusao = ExecutorCompletionService<ResultadoNota>(pool)
+        val futuros = notas.associateWith { nota -> conclusao.submit { tarefa(nota) } }
+        val escritas = mutableSetOf<Int>()
+        try {
+            while (escritas.size < notas.size) {
+                val restante = prazo - System.nanoTime()
+                val pronto = (if (restante > 0) conclusao.poll(restante, TimeUnit.NANOSECONDS) else null) ?: break
+                val resultado = pronto.get()
+                escritas.add(resultado.nota.docEntry)
+                escreve(resultado)
+            }
+            for ((nota, futuro) in futuros.filterKeys { it.docEntry !in escritas }) {
+                if (futuro.isDone && !futuro.isCancelled) {
+                    escreve(futuro.get())
+                } else {
+                    futuro.cancel(true)
+                    logger.warn("Lote NF: DocEntry ${nota.docEntry} passou do prazo de ${prazoSegundos}s")
+                    escreve(ResultadoNota(nota).also { it.erros.add("tempo esgotado (prazo do lote: ${prazoSegundos}s)") })
+                }
+            }
+        } finally {
+            pool.shutdownNow()
+        }
+    }
+
+    // Nao lanca: qualquer falha vira erro da nota, para uma nota quebrada nao derrubar o zip.
+    private fun baixa(nota: NotaFiscalResumo, pdf: Boolean, xml: Boolean, boleto: Boolean,
+                      bankPlusDisponivel: Boolean): ResultadoNota {
+        val resultado = ResultadoNota(nota)
+        try {
+            if (pdf || xml)
+                baixaFiscal(nota, pdf, xml, resultado)
+            if (boleto && !bankPlusDisponivel)
+                resultado.erros.add("boleto nao buscado: BankPlus indisponivel")
+            else if (boleto)
+                baixaBoletos(nota, resultado)
+        } catch (t: Throwable) {
+            logger.warn("Lote NF: falha inesperada no DocEntry ${nota.docEntry}", t)
+            resultado.erros.add("falha inesperada (${motivo(t)})")
+        }
+        return resultado
+    }
+
+    /**
+     * O que vai para o erros.txt. Excecao lancada por este codigo (Exception pura) tem texto
+     * controlado; as de HTTP/IO/JSON carregam corpo de resposta e detalhe interno das APIs,
+     * que ficam so no log (cada chamada ja loga a excecao inteira).
+     */
+    private fun motivo(t: Throwable): String = when {
+        t.javaClass == Exception::class.java -> t.message ?: "erro sem mensagem"
+        t is HttpStatusCodeException -> "HTTP ${t.statusCode.value()}"
+        t is JsonProcessingException -> "resposta em formato inesperado"
+        t is ResourceAccessException || t is IOException -> "sem resposta do servico"
+        else -> "erro interno (${t.javaClass.simpleName})"
+    }
+
+    private fun baixaFiscal(nota: NotaFiscalResumo, pdf: Boolean, xml: Boolean, resultado: ResultadoNota) {
+        val documento = try {
+            taxNfeService.consultar(nota.docEntry, 13)
+        } catch (t: Throwable) {
+            logger.warn("Lote NF: falha ao consultar DocEntry ${nota.docEntry} na TaxPlus", t)
+            resultado.erros.add("consulta na TaxPlus falhou (${motivo(t)})")
+            return
+        }
+        listOfNotNull(
+            if (pdf) TipoArquivo.DANFE to taxNfeService::pdf else null,
+            if (xml) TipoArquivo.XML to taxNfeService::xml else null,
+        ).forEach { (tipo, busca) ->
+            try {
+                resultado.arquivos.add(Arquivo(tipo, "", busca(documento)))
+            } catch (t: Throwable) {
+                logger.warn("Lote NF: falha ao baixar ${tipo.pasta} do DocEntry ${nota.docEntry}", t)
+                resultado.erros.add("${tipo.pasta} nao baixado (${motivo(t)})")
+            }
+        }
+    }
+
+    /**
+     * Um pdf por boleto da nota na BankPlus (um por parcela). Nota sem boleto e o caso comum - a
+     * forma de pagamento nao e boleto - e vai para avisos.txt, nao para erros. Boleto cancelado
+     * ou "Aguardando Cancelamento" fica de fora: o lote costuma ir para o cliente.
+     */
+    private fun baixaBoletos(nota: NotaFiscalResumo, resultado: ResultadoNota) {
+        val filial = nota.filialId ?: run {
+            resultado.erros.add("boleto nao buscado: nota sem filial")
+            return
+        }
+        val boletos = try {
+            bankPlusService.getBoletosBy(filial.toString(), nota.docEntry.toString(), comPrazo = true)
+        } catch (t: Throwable) {
+            logger.warn("Lote NF: falha ao listar boletos do DocEntry ${nota.docEntry} na BankPlus", t)
+            resultado.erros.add("consulta de boleto na BankPlus falhou (${motivo(t)})")
+            return
+        }
+        val validos = boletos.filter { !(it.statusDescricao ?: "").contains("cancel", ignoreCase = true) && it.id != null }
+        if (boletos.isEmpty())
+            resultado.avisos.add("sem boleto na BankPlus")
+        else if (validos.isEmpty())
+            resultado.avisos.add("boleto cancelado, nao incluido (${boletos.mapNotNull { it.statusDescricao }.distinct().joinToString()})")
+        if (validos.isEmpty()) {
+            resultado.semBoleto = true
+            return
+        }
+        validos.sortedBy { it.numeroDaParcela ?: 0 }.forEach { b ->
+            val parcela = b.numeroDaParcela?.let { "-parcela$it" } ?: "-boleto${b.id}"
+            try {
+                val conteudo = bankPlusService.getPdf(b.id.toString(), comPrazo = true) ?: ByteArray(0)
+                if (!String(conteudo.copyOfRange(0, minOf(conteudo.size, 8))).startsWith("%PDF"))
+                    throw Exception(if (conteudo.isEmpty()) "pdf vazio" else "BankPlus nao devolveu um pdf")
+                resultado.arquivos.add(Arquivo(TipoArquivo.BOLETO, parcela, conteudo))
+            } catch (t: Throwable) {
+                logger.warn("Lote NF: falha ao baixar boleto ${b.id} do DocEntry ${nota.docEntry}", t)
+                resultado.erros.add("boleto$parcela nao baixado (${motivo(t)})")
+            }
+        }
+    }
+
+    private fun nomeBase(nota: NotaFiscalResumo): String {
+        val numero = nota.numero?.toString() ?: "doc${nota.docEntry}"
+        val serie = nota.serie?.takeIf { it.isNotBlank() }?.let { "-S$it" } ?: ""
+        val cliente = nota.cardCode?.let { "-$it" } ?: ""
+        return "NF$numero$serie$cliente".replace(Regex("[^A-Za-z0-9._-]"), "_")
+    }
+
+    private fun nomeUnico(base: String, usados: MutableSet<String>): String {
+        var nome = base
+        var i = 2
+        while (!usados.add(nome))
+            nome = "$base-${i++}"
+        return nome
+    }
+
+    private enum class TipoArquivo(val pasta: String, val extensao: String) {
+        DANFE("danfe", "pdf"), XML("xml", "xml"), BOLETO("boleto", "pdf")
+    }
+
+    private class Arquivo(val tipo: TipoArquivo, val sufixo: String, val conteudo: ByteArray)
+
+    private class ResultadoNota(val nota: NotaFiscalResumo) {
+        val arquivos = mutableListOf<Arquivo>()
+        val erros = mutableListOf<String>()
+        val avisos = mutableListOf<String>()
+        var semBoleto = false
+    }
+}
