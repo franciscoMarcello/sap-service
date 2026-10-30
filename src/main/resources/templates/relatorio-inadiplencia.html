@@ -11,7 +11,8 @@
                 <th scope="col">Codigo</th>
                 <th scope="col">Nome</th>
                 <th scope="col">Vendedor</th>
-                <th scope="col">Nº Nota</th>
+                <th scope="col">Tipo</th>
+                <th scope="col">Nº Nota / Adiantamento</th>
                 <th scope="col">Nº Parcela</th>
                 <th scope="col">Total Parcela</th>
                 <th scope="col">Vencimento</th>
@@ -28,6 +29,7 @@
                 <td th:text="${titulo.CardCode}"></td>
                 <td th:text="${titulo.CardName}"></td>
                 <td th:text="${titulo.SlpName}"></td>
+                <td th:text="${titulo.tipo}"></td>
                 <td th:text="${titulo.Serial}"></td>
                 <td th:text="${titulo.InstlmntID}"></td>
                 <td th:text="${#numbers.formatCurrency(titulo.InsTotal)}"></td>
